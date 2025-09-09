@@ -18,8 +18,45 @@ function ThreadSafeVarInfo(vi::AbstractVarInfo)
     # but Mooncake can't differentiate through that. Empirically, nthreads()*2
     # seems to provide an upper bound to maxthreadid(), so we use that here.
     # See https://github.com/TuringLang/DynamicPPL.jl/pull/936
-    accs_by_thread = [map(split, getaccs(vi)) for _ in 1:(Threads.nthreads() * 2)]
-    return ThreadSafeVarInfo(vi, accs_by_thread)
+    # If the inner VarInfo is a DODVarInfo that uses an AccumulatorView backed by
+    # a MutableAccHolder we can avoid constructing NamedTuples on the hot
+    # threadsafe path by giving each thread its own holder instance. This lets
+    # thread-local operations update holder fields in-place without allocation.
+    inner_accs = try
+        getaccs(vi)
+    catch
+        nothing
+    end
+
+    if vi isa DynamicPPL.DODVarInfo && inner_accs !== nothing && inner_accs isa DynamicPPL.AccumulatorView
+        base_nt = inner_accs.base_nt
+        base_holder = inner_accs.holder
+        accs_by_thread = Vector{Any}(undef, Threads.nthreads() * 2)
+        # helper: prefer `split` where available (cheap zeroed copy), fall back to deepcopy
+        maybe_copy_acc = acc -> begin
+            acc === nothing && return nothing
+            try
+                return split(acc)
+            catch
+                return deepcopy(acc)
+            end
+        end
+        for i in 1:length(accs_by_thread)
+            # create a per-thread copy of the holder so accumulators are not shared
+            # between threads. Use a lightweight field-wise copy (split) when
+            # available to avoid the cost of a full deepcopy.
+            hcopy = DynamicPPL.MutableAccHolder(
+                maybe_copy_acc(base_holder.lp),
+                maybe_copy_acc(base_holder.lj),
+                maybe_copy_acc(base_holder.ll),
+            )
+            accs_by_thread[i] = DynamicPPL.AccumulatorView(base_nt, hcopy)
+        end
+        return ThreadSafeVarInfo(vi, accs_by_thread)
+    else
+        accs_by_thread = [map(split, getaccs(vi)) for _ in 1:(Threads.nthreads() * 2)]
+        return ThreadSafeVarInfo(vi, accs_by_thread)
+    end
 end
 ThreadSafeVarInfo(vi::ThreadSafeVarInfo) = vi
 
@@ -37,8 +74,13 @@ end
 # combine them.
 function getacc(vi::ThreadSafeVarInfo, accname::Val)
     main_acc = getacc(vi.varinfo, accname)
-    other_accs = map(accs -> getacc(accs, accname), vi.accs_by_thread)
-    return foldl(combine, other_accs; init=main_acc)
+    # Combine thread-local accumulators into the main_acc without allocating
+    # an intermediate array. This uses `combine` iteratively.
+    acc = main_acc
+    for i in eachindex(vi.accs_by_thread)
+        acc = combine(acc, getacc(vi.accs_by_thread[i], accname))
+    end
+    return acc
 end
 
 hasacc(vi::ThreadSafeVarInfo, accname::Val) = hasacc(vi.varinfo, accname)
@@ -57,14 +99,49 @@ end
 # should _not_ be thread-specific a specific method has to be written.
 function map_accumulator!!(func::Function, vi::ThreadSafeVarInfo, accname::Val)
     tid = Threads.threadid()
-    vi.accs_by_thread[tid] = map_accumulator(func, vi.accs_by_thread[tid], accname)
-    return vi
+    # Fast-path: if the thread-local accumulator is an AccumulatorView we can
+    # apply the function directly to the holder-backed field and avoid
+    # constructing intermediate NamedTuples.
+    local_acc = vi.accs_by_thread[tid]
+    if local_acc isa DynamicPPL.AccumulatorView
+        # update the holder in-place via the provided func; map_accumulator
+        # semantics expect the function to accept an accumulator and return
+        # a (possibly modified) accumulator instance.
+        h = local_acc.holder
+        if accname === Val(:LogPrior)
+            h.lp = func(h.lp)
+        elseif accname === Val(:LogJacobian)
+            h.lj = func(h.lj)
+        elseif accname === Val(:LogLikelihood)
+            h.ll = func(h.ll)
+        else
+            # fallback to generic mapping for other accumulator names
+            vi.accs_by_thread[tid] = map_accumulator(func, local_acc, accname)
+            return vi
+        end
+        return vi
+    else
+        vi.accs_by_thread[tid] = map_accumulator(func, local_acc, accname)
+        return vi
+    end
 end
 
 function map_accumulators!!(func::Function, vi::ThreadSafeVarInfo)
     tid = Threads.threadid()
-    vi.accs_by_thread[tid] = map(func, vi.accs_by_thread[tid])
-    return vi
+    local_acc = vi.accs_by_thread[tid]
+    if local_acc isa DynamicPPL.AccumulatorView
+        # Apply func to each accumulator in the holder where present.
+        h = local_acc.holder
+        h.lp !== nothing && (h.lp = func(h.lp))
+        h.lj !== nothing && (h.lj = func(h.lj))
+        h.ll !== nothing && (h.ll = func(h.ll))
+        # For other accumulators in base_nt, fall back to map on the view which
+        # will materialize an AccumulatorTuple if necessary.
+        return vi
+    else
+        vi.accs_by_thread[tid] = map(func, local_acc)
+        return vi
+    end
 end
 
 has_varnamedvector(vi::ThreadSafeVarInfo) = has_varnamedvector(vi.varinfo)
@@ -177,7 +254,17 @@ end
 function resetaccs!!(vi::ThreadSafeVarInfo)
     vi = Accessors.@set vi.varinfo = resetaccs!!(vi.varinfo)
     for i in eachindex(vi.accs_by_thread)
-        vi.accs_by_thread[i] = map(reset, vi.accs_by_thread[i])
+        local_acc = vi.accs_by_thread[i]
+        if local_acc isa DynamicPPL.AccumulatorView
+            h = local_acc.holder
+            h.lp !== nothing && (h.lp = reset(h.lp))
+            h.lj !== nothing && (h.lj = reset(h.lj))
+            h.ll !== nothing && (h.ll = reset(h.ll))
+            # keep the AccumulatorView wrapper
+            vi.accs_by_thread[i] = local_acc
+        else
+            vi.accs_by_thread[i] = map(reset, local_acc)
+        end
     end
     return vi
 end

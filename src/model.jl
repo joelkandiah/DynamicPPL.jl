@@ -59,6 +59,56 @@ struct Model{F,argnames,defaultnames,missings,Targs,Tdefaults,Ctx<:AbstractConte
 end
 
 """
+    struct ModelDOD{F,argnames,defaultnames,missings,Targs,Tdefaults,Ctx<:AbstractContext}
+        f::F
+        args::NamedTuple{argnames,Targs}
+        defaults::NamedTuple{defaultnames,Tdefaults}
+        context::Ctx=DefaultContext()
+    end
+
+Thin wrapper around `Model` intended as a target for DOD-specific code
+generation. For now it mirrors `Model` and provides a conversion constructor
+from `Model`.
+"""
+struct ModelDOD{F,argnames,defaultnames,missings,Targs,Tdefaults,Ctx<:AbstractContext} <: AbstractProbabilisticProgram
+    f::F
+    args::NamedTuple{argnames,Targs}
+    defaults::NamedTuple{defaultnames,Tdefaults}
+    context::Ctx
+    meta_vns::Vector{VarName}
+    meta_types::Vector{DataType}
+    meta_lens::Vector{Int}
+
+    function ModelDOD{missings}(f::F, args::NamedTuple{argnames,Targs}, defaults::NamedTuple{defaultnames,Tdefaults}, context::Ctx=DefaultContext(), meta_vns=VarName[](), meta_types=DataType[], meta_lens=Int[]) where {missings,F,argnames,Targs,defaultnames,Tdefaults,Ctx}
+        # Normalize to a Vector{VarName} without imposing a concrete input type.
+        mv = meta_vns isa Vector{VarName} ? meta_vns : Vector{VarName}(map(x -> x isa VarName ? x : VarName(x), collect(meta_vns)))
+        mt = meta_types isa Vector{DataType} ? meta_types : Vector{DataType}(collect(meta_types))
+        ml = meta_lens isa Vector{Int} ? meta_lens : Vector{Int}(collect(meta_lens))
+        return new{F,argnames,defaultnames,missings,Targs,Tdefaults,Ctx}(f, args, defaults, context, mv, mt, ml)
+    end
+end
+
+@generated function ModelDOD(f::F, args::NamedTuple{argnames,Targs}, defaults::NamedTuple{kwargnames,Tkwargs}, context::AbstractContext=DefaultContext(); meta_vns=VarName[](), meta_types=DataType[], meta_lens=Int[]) where {F,argnames,Targs,kwargnames,Tkwargs}
+    missing_args = Tuple(name for (name, typ) in zip(argnames, Targs.types) if typ <: Missing)
+    missing_kwargs = Tuple(name for (name, typ) in zip(kwargnames, Tkwargs.types) if typ <: Missing)
+    return :(ModelDOD{$(missing_args..., missing_kwargs...)}(f, args, defaults, context, meta_vns, meta_types, meta_lens))
+end
+
+ModelDOD(m::Model) = ModelDOD(m.f, m.args, m.defaults, m.context)
+
+# Forward-compatible wrappers so existing Model-based evaluation functions work
+# with ModelDOD. These simply delegate to the `Model` implementations.
+function logprior(m::ModelDOD, vi::AbstractVarInfo)
+    return logprior(Model(m.f, m.args, m.defaults, m.context), vi)
+end
+
+function Distributions.loglikelihood(m::ModelDOD, vi::AbstractVarInfo)
+    return Distributions.loglikelihood(Model(m.f, m.args, m.defaults, m.context), vi)
+end
+
+
+
+"""
     Model(f, args::NamedTuple[, defaults::NamedTuple = ()])
 
 Create a model with evaluation function `f` and missing arguments deduced from `args`.

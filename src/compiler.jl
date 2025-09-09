@@ -297,6 +297,288 @@ macro model(expr, warn=false)
     return esc(model(__module__, __source__, expr, warn))
 end
 
+macro model_dod(expr, warn=false)
+    # DOD-specific model generator.
+    return esc(model_dod(__module__, __source__, expr, warn))
+end
+
+function model_dod(mod, linenumbernode, expr, warn)
+    modeldef = build_model_definition(expr)
+
+    # Keep the original body so we can collect VarNames used in the model.
+    orig_body = modeldef[:body]
+
+    # Generate main body (reuse existing logic)
+    # Enable DOD-aware code generation so tilde sites can emit the fast-paths
+    generated_body = generate_mainbody(mod, modeldef[:body], warn; dod=true)
+
+    # Collect VarName literals used in the original body so we can precompute
+    # meta-index locals at evaluator entry and make tilde sites use those
+    # locals (avoids per-site dictionary lookups).
+    vns = collect_model_varnames(orig_body)
+    # Attempt to infer simple concrete element types per-meta from RHSs.
+    meta_types = infer_meta_types(orig_body, vns)
+    # Also attempt to infer per-meta element lengths (1 for scalars, n for vectors)
+    meta_lens = infer_meta_lens(orig_body, vns)
+    # Also collect tilde pairs to attempt to infer element types for each meta.
+    tilde_pairs = collect_model_tilde_pairs(orig_body)
+
+    # Build precomputed meta bindings and per-meta typed-slot locals
+    if !isempty(vns)
+        assigns = map(enumerate(vns)) do (i, vn_expr)
+            meta_sym = meta_sym_for_vn(vn_expr)
+            Expr(:(=), meta_sym, QuoteNode(i))
+        end
+        len_assigns = map(enumerate(vns)) do (i, vn_expr)
+            len_sym = meta_len_sym_for_vn(vn_expr)
+            Expr(:(=), len_sym, QuoteNode(meta_lens[i]))
+        end
+        typed_assigns = map(enumerate(vns)) do (i, vn_expr)
+            typed_sym = meta_typed_sym_for_vn(vn_expr)
+            # Local binding: typed slot if available, otherwise `nothing`.
+            Expr(:(=), typed_sym, :( (__varinfo__.typed_slots !== nothing && length(__varinfo__.typed_slots) >= $(QuoteNode(i)) && __varinfo__.typed_slots[$(QuoteNode(i))] !== nothing) ? __varinfo__.typed_slots[$(QuoteNode(i))] : nothing ))
+        end
+    # Prebind acc_updater to a local so the generated evaluator can
+    # specialize on the concrete updater type when available.
+    acc_updater_assign = Expr(:(=), :(__acc_updater__), :( __varinfo__.acc_updater ))
+        # Prepend the assignments to the generated body (meta index, meta len, typed slots)
+    modeldef[:body] = Expr(:block, assigns..., len_assigns..., typed_assigns..., acc_updater_assign, generated_body)
+    else
+        modeldef[:body] = generated_body
+    end
+
+    # Store the model VarName list on the modeldef so it can be included in the
+    # emitted `ModelDOD` object. This allows `ModelDOD` to carry a per-model
+    # mapping of VarName -> meta index used by the DOD fast-path.
+    modeldef[:meta_vns] = vns
+    modeldef[:meta_types] = meta_types
+    # Build a meta_types and meta_lens vector by matching the collected tilde RHS to vns
+    meta_types = Vector{Any}(undef, length(vns))
+    meta_lens = Vector{Int}(undef, length(vns))
+    for (i, vn) in enumerate(vns)
+        # find a tilde pair matching this VarName (by string form)
+        found = false
+        for (vn_expr, rhs) in tilde_pairs
+            if string(vn_expr) == string(vn)
+                meta_types[i] = infer_meta_type_from_rhs(rhs)
+                meta_lens[i] = infer_meta_lens_from_rhs(rhs)
+                found = true
+                break
+            end
+        end
+        if !found
+            meta_types[i] = :(Any)
+            meta_lens[i] = 1
+        end
+    end
+    modeldef[:meta_types] = meta_types
+    modeldef[:meta_lens] = meta_lens
+
+    return build_output_dod(modeldef, linenumbernode)
+end
+
+
+# Deterministic meta symbol for a VarName expression so that we can emit a
+# consistent local variable name for each VarName used in a model. We use the
+# hash of the VarName expression to avoid collisions in the common case.
+meta_sym_for_vn(vn_expr) = Symbol("meta_", abs(hash(vn_expr)))
+meta_typed_sym_for_vn(vn_expr) = Symbol("meta_typed_", abs(hash(vn_expr)))
+meta_len_sym_for_vn(vn_expr) = Symbol("meta_len_", abs(hash(vn_expr)))
+
+
+# Walk the original model body and collect the unique VarName literal
+# expressions corresponding to the left-hand side of `~` / `.~` sites.
+function collect_model_varnames(expr)
+    seen = Set{Any}()
+    out = Any[]
+    MacroTools.postwalk(expr) do ex
+        args = getargs_tilde(ex)
+        if args !== nothing
+            L, R = args
+            vn = make_varname_expression(L)
+            if vn ∉ seen
+                push!(out, vn)
+                push!(seen, vn)
+            end
+        end
+        args2 = getargs_dottilde(ex)
+        if args2 !== nothing
+            L, R = args2
+            vn = make_varname_expression(L)
+            if vn ∉ seen
+                push!(out, vn)
+                push!(seen, vn)
+            end
+        end
+        return ex
+    end
+    return out
+end
+
+# Heuristic: look at RHS AST and try to classify a likely element type.
+function infer_type_from_rhs(rhs)
+    if rhs isa Expr && rhs.head == :call
+        f = rhs.args[1]
+        fname = string(f)
+        # common multivariate distributions
+        if occursin("MvNormal", fname) || occursin("Multivariate", fname)
+            return Vector{Float64}
+        end
+        # common univariate distributions -> scalar Float64
+        if occursin("Normal", fname) || occursin("Beta", fname) || occursin("Gamma", fname) || occursin("Exponential", fname) || occursin("Uniform", fname) || occursin("InverseGamma", fname)
+            return Float64
+        end
+    end
+    # fallback
+    return Any
+end
+
+# Collect pairs of (VarName expression, RHS expression) for tilde sites so
+# codegen can attempt to infer per-meta element types.
+function collect_model_tilde_pairs(expr)
+    pairs = Vector{Tuple{Any,Any}}()
+    MacroTools.postwalk(expr) do ex
+        args = getargs_tilde(ex)
+        if args !== nothing
+            L, R = args
+            push!(pairs, (make_varname_expression(L), R))
+        end
+        args2 = getargs_dottilde(ex)
+        if args2 !== nothing
+            L, R = args2
+            # For dotted-tilde sites we record the per-element RHS expression
+            push!(pairs, (make_varname_expression(L), R))
+        end
+        return ex
+    end
+    return pairs
+end
+
+# Infer per-meta length (number of scalar elements) from RHS expressions.
+function infer_meta_lens(body, vns)
+    pairs = collect_model_tilde_pairs(body)
+    inferred = Dict{Any,Int}()
+    for (vn_expr, rhs) in pairs
+        inferred[vn_expr] = infer_meta_lens_from_rhs(rhs)
+    end
+    return [get(inferred, vn, 1) for vn in vns]
+end
+
+function infer_meta_lens_from_rhs(rhs)
+    # If RHS is a call to a multivariate distribution, guess length 2 (conservative)
+    if rhs isa Expr && rhs.head == :call
+        f = rhs.args[1]
+        fname = string(f)
+        if occursin("MvNormal", fname) || occursin("Multivariate", fname) || occursin("Dirichlet", fname)
+            return 2
+        end
+    end
+    # If RHS is a vector literal, use its length
+    if rhs isa Expr && rhs.head == :vect
+        return length(rhs.args)
+    end
+    return 1
+end
+
+# Build a simple meta_types vector for `@model_dod` by scanning tilde sites.
+function infer_meta_types(body, vns)
+    pairs = collect_model_tilde_pairs(body)
+    inferred = Dict{Any,Any}()
+    for (vn_expr, rhs) in pairs
+        inferred[vn_expr] = infer_type_from_rhs(rhs)
+    end
+    return [get(inferred, vn, Any) for vn in vns]
+end
+
+# Very small heuristic inference of meta element types from RHS expressions.
+# This is intentionally conservative: unrecognized RHS -> Any.
+function infer_meta_type_from_rhs(rhs)
+    # If RHS is a call expression, attempt to extract the called name.
+    if Meta.isexpr(rhs, :call)
+        fn = rhs.args[1]
+        # fn may be a symbol or a dotted access like Distributions.Normal
+        name = if fn isa Symbol
+            String(fn)
+        elseif Meta.isexpr(fn, :.)
+            # take the last part e.g. Distributions.Normal -> Normal
+            last(fn.args) isa Symbol ? String(last(fn.args)) : ""
+        else
+            ""
+        end
+        if name in ("Normal", "Uniform", "Beta", "Gamma", "Exponential", "InverseGamma", "Bernoulli", "Binomial", "Poisson")
+            return :(Float64)
+        elseif occursin("Mv", name) || name in ("MvNormal", "MvNormalDiag", "Dirichlet")
+            return Expr(:curly, :Vector, :Float64)
+        else
+            return :(Any)
+        end
+    else
+        return :(Any)
+    end
+end
+
+function build_output_dod(modeldef, linenumbernode)
+    args = transform_args(modeldef[:args])
+    kwargs = transform_args(modeldef[:kwargs])
+
+    # Need to update `args` and `kwargs` since we might have added `TypeWrap` to the types.
+    modeldef[:args] = args
+    modeldef[:kwargs] = kwargs
+
+    ## Build the anonymous evaluator from the user-provided model definition.
+    evaluatordef = copy(modeldef)
+
+    # Add the internal arguments to the user-specified arguments (positional + keywords).
+    # Use abstract types so the evaluator accepts either `Model` or `ModelDOD` and
+    # `AbstractVarInfo` (wrappers may convert between ModelDOD and Model).
+    # For DOD models, accept a concrete `DODVarInfo` so hot-path field accesses
+    # (e.g., `acc_updater`, `metas`, `typed_slots`) can be type-specialized by
+    # the compiler and avoid boxing/dispatch overhead.
+    evaluatordef[:args] = vcat(
+        [:(__model__::$(DynamicPPL.AbstractProbabilisticProgram)), :(__varinfo__::($(DynamicPPL.DODVarInfo){AU} where AU))],
+        args,
+    )
+
+    evaluatordef[:body] = MacroTools.@q begin
+        $(linenumbernode)
+        $(replace_returns(add_return_to_last_statment(modeldef[:body])))
+    end
+
+    ## Build the model function.
+
+    if MacroTools.@capture(modeldef[:name], ::T_)
+        name = gensym(:f)
+        modeldef[:name] = Expr(:(::), name, T)
+    elseif MacroTools.@capture(modeldef[:name], (name_::_ | name_))
+    else
+        throw(ArgumentError("unsupported format of model function"))
+    end
+
+    args_split = map(MacroTools.splitarg, args)
+    kwargs_split = map(MacroTools.splitarg, kwargs)
+    args_nt = namedtuple_from_splitargs(args_split)
+    kwargs_inclusion = map(splitarg_to_expr, kwargs_split)
+
+    # Build expressions that construct the vector of meta VarNames, types and lengths
+    meta_vec_expr = Expr(:vect, (modeldef[:meta_vns])...)
+    # meta types -> use inferred types if available, default to Any
+    if haskey(modeldef, :meta_types)
+        meta_types_expr = Expr(:vect, (modeldef[:meta_types])...)
+    else
+        meta_types_expr = Expr(:vect, (fill(:(Any), length(modeldef[:meta_vns]))...))
+    end
+    meta_lens_expr = Expr(:vect, (fill(:(1), length(modeldef[:meta_vns]))...))
+    modeldef[:body] = MacroTools.@q begin
+        $(linenumbernode)
+        return $(DynamicPPL.ModelDOD)($name, $args_nt, (; $(kwargs_inclusion...)); meta_vns=$(meta_vec_expr), meta_types=$(meta_types_expr), meta_lens=$(meta_lens_expr))
+    end
+
+    return MacroTools.@q begin
+        $(MacroTools.combinedef(evaluatordef))
+        $(Base).@__doc__ $(MacroTools.combinedef(modeldef))
+    end
+end
+
 function model(mod, linenumbernode, expr, warn)
     modeldef = build_model_definition(expr)
 
@@ -346,10 +628,10 @@ Generate the body of the main evaluation function from expression `expr` and arg
 If `warn` is true, a warning is displayed if internal variables are used in the model
 definition.
 """
-generate_mainbody(mod, expr, warn) = generate_mainbody!(mod, Symbol[], expr, warn)
+generate_mainbody(mod, expr, warn; dod=false) = generate_mainbody!(mod, Symbol[], expr, warn; dod=dod)
 
-generate_mainbody!(mod, found, x, warn) = x
-function generate_mainbody!(mod, found, sym::Symbol, warn)
+generate_mainbody!(mod, found, x, warn; dod=false) = x
+function generate_mainbody!(mod, found, sym::Symbol, warn; dod=false)
     if warn && sym in INTERNALNAMES && sym ∉ found
         @warn "you are using the internal variable `$sym`"
         push!(found, sym)
@@ -357,7 +639,7 @@ function generate_mainbody!(mod, found, sym::Symbol, warn)
 
     return sym
 end
-function generate_mainbody!(mod, found, expr::Expr, warn)
+function generate_mainbody!(mod, found, expr::Expr, warn; dod=false)
     # Do not touch interpolated expressions
     expr.head === :$ && return expr.args[1]
 
@@ -375,7 +657,7 @@ function generate_mainbody!(mod, found, expr::Expr, warn)
     if args_dottilde !== nothing
         L, R = args_dottilde
         return generate_mainbody!(
-            mod, found, Base.remove_linenums!(generate_dot_tilde(L, R)), warn
+            mod, found, Base.remove_linenums!(generate_dot_tilde(L, R)), warn; dod=dod
         )
     end
 
@@ -385,8 +667,9 @@ function generate_mainbody!(mod, found, expr::Expr, warn)
         L, R = args_tilde
         return Base.remove_linenums!(
             generate_tilde(
-                generate_mainbody!(mod, found, L, warn),
-                generate_mainbody!(mod, found, R, warn),
+                generate_mainbody!(mod, found, L, warn; dod=dod),
+                generate_mainbody!(mod, found, R, warn; dod=dod),
+                dod=dod,
             ),
         )
     end
@@ -397,8 +680,8 @@ function generate_mainbody!(mod, found, expr::Expr, warn)
         L, R = args_assign
         return Base.remove_linenums!(
             generate_assign(
-                generate_mainbody!(mod, found, L, warn),
-                generate_mainbody!(mod, found, R, warn),
+                generate_mainbody!(mod, found, L, warn; dod=dod),
+                generate_mainbody!(mod, found, R, warn; dod=dod),
             ),
         )
     end
@@ -443,7 +726,7 @@ end
 Generate an `observe` expression for data variables and `assume` expression for parameter
 variables.
 """
-function generate_tilde(left, right)
+function generate_tilde(left, right; dod=false)
     isliteral(left) && return generate_tilde_literal(left, right)
 
     # Otherwise it is determined by the model or its value,
@@ -459,7 +742,7 @@ function generate_tilde(left, right)
                 __model__.context, $(DynamicPPL.prefix)(__model__.context, $vn)
             )
         elseif $isassumption
-            $(generate_tilde_assume(left, dist, vn))
+            $(generate_tilde_assume(left, dist, vn; dod=dod))
         else
             # If `vn` is not in `argnames`, we need to make sure that the variable is defined.
             if !$(DynamicPPL.inargnames)($vn, __model__)
@@ -468,7 +751,7 @@ function generate_tilde(left, right)
                 )
             end
 
-            $value, __varinfo__ = $(DynamicPPL.tilde_observe!!)(
+            $value, __varinfo__ = $(dod ? :(DynamicPPL.tilde_observe_dod!!) : :(DynamicPPL.tilde_observe!!))(
                 __model__.context,
                 $(DynamicPPL.check_tilde_rhs)($dist),
                 $(maybe_view(left)),
@@ -480,7 +763,7 @@ function generate_tilde(left, right)
     end
 end
 
-function generate_tilde_assume(left, right, vn)
+function generate_tilde_assume(left, right, vn; dod=false)
     # HACK: Because the Setfield.jl macro does not support assignment
     # with multiple arguments on the LHS, we need to capture the return-values
     # and then update the LHS variables one by one.
@@ -492,14 +775,101 @@ function generate_tilde_assume(left, right, vn)
         )
     end
 
-    return quote
-        $value, __varinfo__ = $(DynamicPPL.tilde_assume!!)(
-            __model__.context,
-            $(DynamicPPL.unwrap_right_vn)($(DynamicPPL.check_tilde_rhs)($right), $vn)...,
-            __varinfo__,
-        )
-        $expr
-        $value
+    if !dod
+        return quote
+            $value, __varinfo__ = $(DynamicPPL.tilde_assume!!)(
+                __model__.context,
+                $(DynamicPPL.unwrap_right_vn)($(DynamicPPL.check_tilde_rhs)($right), $vn)...,
+                __varinfo__,
+            )
+            $expr
+            $value
+        end
+    else
+        # DOD path: use the precomputed local meta_<hash> binding created by
+        # `@model_dod` at evaluator entry. Emit an inlined fast-path that uses
+        # the integer meta index to avoid per-site closures and small-dispatches.
+        # Fall back to the VarName-based wrapper when the meta binding is zero.
+        meta_sym = meta_sym_for_vn(vn)
+        return quote
+            # Fallback to non-meta path if the meta local is not set
+            if $(meta_sym) == 0
+                $value, __varinfo__ = $(DynamicPPL.tilde_assume_dod!!)(
+                    __model__.context,
+                    $(DynamicPPL.unwrap_right_vn)($(DynamicPPL.check_tilde_rhs)($right), $vn)...,
+                    $vn,
+                    __varinfo__,
+                )
+            else
+                # Fast-path: inline the DOD meta-indexed assume handling.
+                meta_i = $(meta_sym)
+                # access meta and backing vector directly to avoid function call
+                meta = __varinfo__.metas[meta_i]
+                if meta.idx == 0
+                    # variable not present: fall back to generic wrapper to preserve semantics
+                    $value, __varinfo__ = $(DynamicPPL.tilde_assume_dod!!)(
+                        __model__.context,
+                        $(DynamicPPL.unwrap_right_vn)($(DynamicPPL.check_tilde_rhs)($right), $vn)...,
+                        $vn,
+                        __varinfo__,
+                    )
+                else
+                    # Prefer per-model typed slot local (prebound at entry) if available
+                    typed_local = $(meta_typed_sym_for_vn(vn))
+                    vec = typed_local === nothing ? (meta.vec === nothing ? __varinfo__.values[meta.type] : meta.vec) : typed_local
+                    # read internal value without creating slices. Use the
+                    # prebound per-meta length local (meta_len_<hash>) so the
+                    # compiler can constant-propagate small fixed lengths when
+                    # available. We keep the `view` for reads to preserve the
+                    # expected input shape for transforms.
+                    if $(meta_len_sym_for_vn(vn)) == 1
+                        y = vec[meta.idx]
+                    else
+                        # for multivariate, use a non-allocating view into the backing
+                        # storage to avoid creating temporary arrays when calling transforms.
+                        y = view(vec, meta.idx:(meta.idx + $(meta_len_sym_for_vn(vn)) - 1))
+                    end
+                    f = $(DynamicPPL.from_maybe_linked_internal_transform)(__varinfo__, $vn, $right)
+                    x, inv_logjac = $(DynamicPPL.with_logabsdet_jacobian)(f, y)
+
+                    # update accumulators: prefer a cached typed updater to avoid
+                    # exception-driven fallbacks and small-dispatch overhead.
+                        if __acc_updater__ !== nothing
+                            $(DynamicPPL.acc_updater_assume)(__acc_updater__, __varinfo__, x, -inv_logjac, $vn, $right)
+                        elseif __varinfo__.acc_default !== nothing
+                        # backward-compatible path: update holder via the generic API
+                        h = __varinfo__.acc_default
+                        h.lp = $(DynamicPPL.accumulate_assume!!)(h.lp, x, -inv_logjac, $vn, $right)
+                        h.lj = $(DynamicPPL.accumulate_assume!!)(h.lj, x, -inv_logjac, $vn, $right)
+                        h.ll = $(DynamicPPL.accumulate_assume!!)(h.ll, x, -inv_logjac, $vn, $right)
+                    else
+                        __varinfo__ = $(DynamicPPL.map_accumulators!!)(a->$(DynamicPPL.accumulate_assume!!)(a, x, -inv_logjac, $vn, $right), __varinfo__)
+                    end
+
+                    # write back the internal value without range allocations.
+                    # For very small fixed lengths we emit unrolled element
+                    # assignments to avoid the temporary `SubArray` allocation
+                    # and bounds-check overhead of `copyto!` on the hot path.
+                    if $(meta_len_sym_for_vn(vn)) == 1
+                        vec[meta.idx] = x
+                    elseif $(meta_len_sym_for_vn(vn)) == 2
+                        vec[meta.idx] = x[1]
+                        vec[meta.idx + 1] = x[2]
+                    elseif $(meta_len_sym_for_vn(vn)) == 3
+                        vec[meta.idx] = x[1]
+                        vec[meta.idx + 1] = x[2]
+                        vec[meta.idx + 2] = x[3]
+                    else
+                        # fallback: generic copy for larger or unknown lengths
+                        copyto!(view(vec, meta.idx:(meta.idx + meta.len - 1)), x)
+                    end
+
+                    $value = x
+                end
+            end
+            $expr
+            $value
+        end
     end
 end
 

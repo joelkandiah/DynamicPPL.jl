@@ -289,6 +289,11 @@ function typed_varinfo(model::Model, sampler::AbstractSampler=SampleFromPrior())
     return typed_varinfo(Random.default_rng(), model, sampler)
 end
 
+# For ModelDOD, create a DODVarInfo pre-seeded from the model mapping.
+function typed_varinfo(model::DynamicPPL.ModelDOD, sampler::AbstractSampler=SampleFromPrior())
+    return DODVarInfo(model)
+end
+
 """
     untyped_vector_varinfo([rng, ]model[, sampler])
 

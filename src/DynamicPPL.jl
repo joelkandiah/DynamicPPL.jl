@@ -85,6 +85,8 @@ export AbstractVarInfo,
     @varname,
     # Compiler
     @model,
+    @model_dod,
+    ModelDOD,
     # Utilities
     init,
     OrderedDict,
@@ -169,19 +171,34 @@ abstract type AbstractVarInfo <: AbstractModelTrace end
 # Necessary forward declarations
 include("utils.jl")
 include("chains.jl")
+include("accumulators.jl")
+include("default_accumulators.jl")
+
+# Data structures used by VarInfo implementations
+include("varnamedvector.jl")
+
+# Model type (VarInfo/varinfo may reference Model)
 include("model.jl")
+# Abstract VarInfo and thread-safe wrapper
+include("abstract_varinfo.jl")
+include("threadsafe.jl")
+
+# Sampler utilities (provide SampleFromPrior etc.)
 include("sampler.jl")
+
+# Core VarInfo implementations
+include("varinfo.jl")
+include("simple_varinfo.jl")
+
+# DOD VarInfo extension (depends on Metadata/VarNamedVector/VarInfo types)
+include("dod_varinfo.jl")
+export VarMeta, DODVarInfo, add_variable!, delete_variable!, get_variable, tilde_assume_dod!!, tilde_observe_dod!!
+
+# Remaining core pieces
 include("varname.jl")
 include("distribution_wrappers.jl")
 include("contexts.jl")
 include("submodel.jl")
-include("varnamedvector.jl")
-include("accumulators.jl")
-include("default_accumulators.jl")
-include("abstract_varinfo.jl")
-include("threadsafe.jl")
-include("varinfo.jl")
-include("simple_varinfo.jl")
 include("context_implementations.jl")
 include("compiler.jl")
 include("pointwise_logdensities.jl")

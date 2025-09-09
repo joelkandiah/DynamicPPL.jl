@@ -62,6 +62,32 @@ function AbstractMCMC.step(
     return vi, nothing
 end
 
+# Delegate AbstractMCMC.step for ModelDOD to the Model implementation so that
+# AbstractMCMC-based samplers (e.g. `sample`) work with `ModelDOD` instances.
+function AbstractMCMC.step(
+    rng::Random.AbstractRNG,
+    model::ModelDOD,
+    sampler::Union{SampleFromUniform,SampleFromPrior},
+    state=nothing;
+    kwargs...,
+)
+    # Reuse a DODVarInfo passed in `state` when available to avoid
+    # reconstructing the per-model storage on every step.
+    if state === nothing
+        vi = DODVarInfo(model)
+    elseif state isa DODVarInfo
+        vi = state
+    else
+        # Unknown state shape: fall back to creating a fresh DODVarInfo.
+        vi = DODVarInfo(model)
+    end
+
+    m = Model(model.f, model.args, model.defaults, model.context)
+    DynamicPPL.evaluate_and_sample!!(rng, m, vi, sampler)
+    # Return the updated varinfo as the new state so it can be reused.
+    return vi, vi
+end
+
 """
     default_varinfo(rng, model, sampler)
 
@@ -77,6 +103,14 @@ Return a default varinfo object for the given `model` and `sampler`.
 """
 function default_varinfo(rng::Random.AbstractRNG, model::Model, sampler::AbstractSampler)
     init_sampler = initialsampler(sampler)
+    # If the model is a compiled DOD model, create a DODVarInfo directly to
+    # reuse the preallocated, typed storage the compiler produced. This avoids
+    # constructing the generic `VarInfo` + metadata path and reduces
+    # allocations for the hot sampling path.
+    if model isa ModelDOD
+        return DODVarInfo(model)
+    end
+
     return typed_varinfo(rng, model, init_sampler)
 end
 
@@ -95,6 +129,18 @@ function AbstractMCMC.sample(
     )
 end
 
+# Delegate AbstractMCMC.sample for ModelDOD to the Model implementation.
+function AbstractMCMC.sample(
+    rng::Random.AbstractRNG,
+    model::ModelDOD,
+    sampler::Sampler,
+    N::Integer;
+    kwargs...
+)
+    m = Model(model.f, model.args, model.defaults, model.context)
+    return AbstractMCMC.sample(rng, m, sampler, N; kwargs...)
+end
+
 function AbstractMCMC.sample(
     rng::Random.AbstractRNG,
     model::Model,
@@ -110,6 +156,20 @@ function AbstractMCMC.sample(
     return AbstractMCMC.mcmcsample(
         rng, model, sampler, parallel, N, nchains; chain_type, initial_state, kwargs...
     )
+end
+
+# Delegate parallel AbstractMCMC.sample for ModelDOD to the Model implementation.
+function AbstractMCMC.sample(
+    rng::Random.AbstractRNG,
+    model::ModelDOD,
+    sampler::Sampler,
+    parallel::AbstractMCMC.AbstractMCMCEnsemble,
+    N::Integer,
+    nchains::Integer;
+    kwargs...
+)
+    m = Model(model.f, model.args, model.defaults, model.context)
+    return AbstractMCMC.sample(rng, m, sampler, parallel, N, nchains; kwargs...)
 end
 
 # initial step: general interface for resuming and

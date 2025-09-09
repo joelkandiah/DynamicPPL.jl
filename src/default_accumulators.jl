@@ -82,7 +82,7 @@ linked or not.
 # Fields
 $(TYPEDFIELDS)
 """
-struct LogPriorAccumulator{T<:Real} <: LogProbAccumulator{T}
+mutable struct LogPriorAccumulator{T<:Real} <: LogProbAccumulator{T}
     "the scalar log prior value"
     logp::T
 end
@@ -95,6 +95,17 @@ function accumulate_assume!!(acc::LogPriorAccumulator, val, logjac, vn, right)
     return acclogp(acc, logpdf(right, val))
 end
 accumulate_observe!!(acc::LogPriorAccumulator, right, left, vn) = acc
+
+# In-place mutation API: preferred fast-path for DOD accumulators. These
+# methods mutate `acc` and return it. Callers may still receive a new object
+# from the generic fallback and must handle that case by reassigning.
+function accumulate_assume_inplace!!(acc::LogPriorAccumulator, val, logjac, vn, right)
+    acc.logp += logpdf(right, val)
+    return acc
+end
+function accumulate_observe_inplace!!(acc::LogPriorAccumulator, right, left, vn)
+    return acc
+end
 
 """
     LogJacobianAccumulator{T<:Real} <: LogProbAccumulator{T}
@@ -126,7 +137,7 @@ distribution to unconstrained space.
 # Fields
 $(TYPEDFIELDS)
 """
-struct LogJacobianAccumulator{T<:Real} <: LogProbAccumulator{T}
+mutable struct LogJacobianAccumulator{T<:Real} <: LogProbAccumulator{T}
     "the logabsdet of the link transform Jacobian"
     logjac::T
 end
@@ -140,6 +151,14 @@ function accumulate_assume!!(acc::LogJacobianAccumulator, val, logjac, vn, right
 end
 accumulate_observe!!(acc::LogJacobianAccumulator, right, left, vn) = acc
 
+function accumulate_assume_inplace!!(acc::LogJacobianAccumulator, val, logjac, vn, right)
+    acc.logjac += logjac
+    return acc
+end
+function accumulate_observe_inplace!!(acc::LogJacobianAccumulator, right, left, vn)
+    return acc
+end
+
 """
     LogLikelihoodAccumulator{T<:Real} <: LogProbAccumulator{T}
 
@@ -148,7 +167,7 @@ An accumulator that tracks the cumulative log likelihood during model execution.
 # Fields
 $(TYPEDFIELDS)
 """
-struct LogLikelihoodAccumulator{T<:Real} <: LogProbAccumulator{T}
+mutable struct LogLikelihoodAccumulator{T<:Real} <: LogProbAccumulator{T}
     "the scalar log likelihood value"
     logp::T
 end
@@ -163,6 +182,14 @@ function accumulate_observe!!(acc::LogLikelihoodAccumulator, right, left, vn)
     # they handle vectors differently:
     # https://github.com/JuliaStats/Distributions.jl/issues/1972
     return acclogp(acc, Distributions.loglikelihood(right, left))
+end
+
+function accumulate_assume_inplace!!(acc::LogLikelihoodAccumulator, val, logjac, vn, right)
+    return acc
+end
+function accumulate_observe_inplace!!(acc::LogLikelihoodAccumulator, right, left, vn)
+    acc.logp += Distributions.loglikelihood(right, left)
+    return acc
 end
 
 function default_accumulators(::Type{FloatT}=LogProbType) where {FloatT}
