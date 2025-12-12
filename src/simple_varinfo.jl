@@ -212,7 +212,7 @@ end
 function SimpleVarInfo(values)
     return SimpleVarInfo{LogProbType}(values)
 end
-function SimpleVarInfo(values::Union{<:NamedTuple,<:AbstractDict{<:VarName}})
+function SimpleVarInfo(values::Union{<:NamedTuple,<:AbstractDict{<:VarName},<:Dictionary})
     return if isempty(values)
         # Can't infer from values, so we just use default.
         SimpleVarInfo{LogProbType}(values)
@@ -336,6 +336,29 @@ function getindex_internal(
 end
 
 Base.haskey(vi::SimpleVarInfo, vn::VarName) = hasvalue(vi.values, vn)
+
+# Dictionary (Dictionaries.jl)
+function getindex_internal(vi::SimpleVarInfo{<:Dictionary}, vn::VarName)
+    val = vi.values[getsym(vn)]
+    optic = AbstractPPL.getoptic(vn)
+    return optic(val)
+end
+
+function Base.haskey(vi::SimpleVarInfo{<:Dictionary}, vn::VarName)
+    return haskey(vi.values, getsym(vn))
+end
+
+
+function BangBang.setindex!!(vi::SimpleVarInfo{<:Dictionary}, val, vn::VarName)
+    sym = getsym(vn)
+    root_val = vi.values[sym]
+    optic = AbstractPPL.getoptic(vn)
+    new_root_val = set!!(root_val, optic, val)
+    
+    # Use Dictionaries.set! for in-place modification (since Dictionary is mutable)
+    new_dict = Dictionaries.set!(vi.values, sym, new_root_val)
+    return Accessors.@set vi.values = new_dict
+end
 
 function BangBang.setindex!!(vi::SimpleVarInfo, val, vn::VarName)
     # For `NamedTuple` we treat the symbol in `vn` as the _property_ to set.
@@ -497,6 +520,9 @@ function values_as(vi::SimpleVarInfo, ::Type{D}) where {D<:AbstractDict}
 end
 function values_as(vi::SimpleVarInfo{<:AbstractDict}, ::Type{NamedTuple})
     return NamedTuple((Symbol(k), v) for (k, v) in vi.values)
+end
+function values_as(vi::SimpleVarInfo{<:Dictionary}, ::Type{NamedTuple})
+    return NamedTuple((Symbol(k), v) for (k, v) in pairs(vi.values))
 end
 function values_as(vi::SimpleVarInfo, ::Type{T}) where {T}
     return values_as(vi.values, T)

@@ -151,6 +151,7 @@ const UntypedVarInfo = VarInfo{<:Metadata}
 # something which carried both its keys as well as its values' types as type
 # parameters.
 const NTVarInfo = VarInfo{<:NamedTuple}
+const DictVarInfo = VarInfo{<:Dictionary}
 const VarInfoOrThreadSafeVarInfo{Tmeta} = Union{
     VarInfo{Tmeta},ThreadSafeVarInfo{<:VarInfo{Tmeta}}
 }

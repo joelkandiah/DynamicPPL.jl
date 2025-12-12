@@ -6,6 +6,7 @@ using Bijectors
 using Compat
 using Distributions
 using OrderedCollections: OrderedCollections, OrderedDict
+using Dictionaries: Dictionaries, Dictionary, dictionary, set
 using Printf: Printf
 
 using AbstractMCMC: AbstractMCMC
@@ -51,41 +52,49 @@ export AbstractVarInfo,
     LogLikelihoodAccumulator,
     LogPriorAccumulator,
     LogJacobianAccumulator,
-    push!!,
-    empty!!,
-    subset,
+    DictVarInfo,
+    UntypedVarInfo,
+    typed_varinfo,
+    typed_dict_varinfo,
     getlogp,
-    getlogjoint,
-    getlogprior,
-    getloglikelihood,
-    getlogjac,
-    getlogjoint_internal,
-    getlogprior_internal,
     setlogp!!,
-    setlogprior!!,
-    setlogjac!!,
-    setloglikelihood!!,
-    acclogp,
     acclogp!!,
-    acclogjac!!,
-    acclogprior!!,
-    accloglikelihood!!,
-    is_transformed,
-    set_transformed!!,
-    link,
-    link!!,
-    invlink,
-    invlink!!,
+    resetlogp!!,
+    get_num_produce,
+    set_num_produce!,
+    reset_num_produce!,
+    increment_num_produce!,
+    set_retained_vns_del_by_spl!,
+    is_flagged,
+    set_flag!,
+    unset_flag!,
+    set_gid!,
+    updategid!,
+    setorder!,
+    istrans,
+    link!,
+    invlink!,
+    tonamedtuple,
     values_as,
-    # VarName (reexport from AbstractPPL)
+    # VarName
     VarName,
+    inspace,
     subsumes,
     @varname,
     # Compiler
     @model,
     # Utilities
     OrderedDict,
-    typed_identity,
+    vectorize,
+    reconstruct,
+    reconstruct,
+    Sample,
+    Chain,
+    init,
+    solve,
+    MCMCThreads,
+    MCMCDistributed,
+    MCMCSerial,
     # Model
     Model,
     getmissings,
@@ -114,19 +123,35 @@ export AbstractVarInfo,
     # Tilde pipeline
     tilde_assume!!,
     tilde_observe!!,
-    # Initialisation
+    # Probabilistic
+    LikelihoodContext,
+    PriorContext,
+    MiniBatchContext,
+    PrefixContext,
+    ConditionContext,
+    assume,
+    dot_assume,
+    observe,
+    dot_observe,
+    tilde_assume,
+    tilde_observe,
+    dot_tilde_assume,
+    dot_tilde_observe,
+    # Pseudo-marginal
+    PseudoMarginalContext,
+    # Initialization
     AbstractInitStrategy,
     InitFromPrior,
     InitFromUniform,
     InitFromParams,
-    init,
     get_param_eltype,
     # Pseudo distributions
     NamedDist,
     NoDist,
     # Convenience functions
-    logprior,
     logjoint,
+    logprior,
+    loglikelihood,
     pointwise_prior_logdensities,
     pointwise_logdensities,
     pointwise_loglikelihoods,
@@ -139,6 +164,8 @@ export AbstractVarInfo,
     prefix,
     returned,
     to_submodel,
+    # Selection
+    @submodel,
     # Struct to hold model outputs
     ParamsWithStats,
     # Convenience macros
@@ -200,6 +227,7 @@ include("default_accumulators.jl")
 include("abstract_varinfo.jl")
 include("threadsafe.jl")
 include("varinfo.jl")
+include("dict_varinfo.jl")
 include("simple_varinfo.jl")
 include("onlyaccs.jl")
 include("compiler.jl")
